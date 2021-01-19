@@ -1,0 +1,227 @@
+---
+title: "populating attendance worksheets"
+author: "John Little"
+date:  "`r sys.Date()`"
+---
+
+This is a beta script (Jan. 19. 2021).  Not in production.
+
+This script will scrape LibCal and generate a comprehensive data frame of all the workshops listed at LibCal.  (Do this at the beginning of the semester b/c LibCal API will not present past events.)  Then there is data wrangling.  Then using `googleshets4` and the `purrr::walk` function to rowwise iterate the data frame and make an attendance sheet for each workshop found at LibCal.  
+
+Note: The `googlesheets4` library requires realtime interaction with the RStudio console to authenticate the connection Google Drive.
+
+[spring master list - 2021 - manual](https://docs.google.com/spreadsheets/d/1tJ_4D-sEm8kPt8YIZ0_m_9RpQ2-XjOIbs6mHis9oRwE/edit#gid=0)  
+[example attendance blank sheet](https://docs.google.com/spreadsheets/d/1zbuWbnOexPq9KkRpv7oRnHqF-pCMSS7aegm3JjhwXkU/edit#gid=1561693836)
+
+```{r}
+# This code uses rvest to pull in the current list of DVS workshops
+Sys.setenv(TZ="America/New_York")
+library(rvest)
+library(tidyverse)
+library(lubridate)
+library(googlesheets4)
+```
+
+## Functions
+
+```{r}
+get_workshop_id <- . %>% 
+  mutate(workshop_id = str_extract(registration, "(?<=event/)\\d+")) 
+
+```
+
+
+## Ingest data
+
+### column headings 
+
+make a vector of column headings that will become the headings of the google sheests attendance records
+
+```{r}
+blank_df <- tibble("Attended (x or blank)" = NA,
+                "Registration Status (Registered, Waitlist, or Walk-in)"  = NA,
+                # "Workshop Date",
+                # "Workshop Name",
+                # "WorkshopID",
+                "First Name" = NA,
+                "Last Name" = NA,
+                "Email" = NA,
+                "Booking Made" = NA,
+                "Attendance" = NA,
+                "Are you affiliated with Duke University, Duke Medical Center, DCRI, or another Duke group?" = NA,
+                "Academic Status (or other)" = NA,
+                "Discipline or Affiliation" = NA,
+                "Institutes, Initiatives, or Program Affiliation" = NA,
+                "Where did you hear about this event?" = NA,
+                "Have you consulted with Data and Visualization Services before this workshop?" = NA,
+                "Would you like to receive more information about DVS events and training?" = NA,
+                "I'm interested in registering for this workshop because:" = NA,
+                "If other, describe below:" = NA)
+```
+
+###  scrape webpage
+
+```{r}
+dvs_cal <- read_html("https://api3.libcal.com/api_events.php?iid=971&m=upc&cid=3819&c=&d=25858&l=50&target=_blank")
+# dvs_cal
+```
+
+Using rvest functions to select data via CSS
+
+```{r}
+ntitle <- html_nodes(dvs_cal, ".s-lc-ea-ttit a")
+ndate  <- html_nodes(dvs_cal, ".s-lc-ea-tdat td:nth-child(2)")
+npresenter <- html_nodes(dvs_cal, ".s-lc-ea-tpre td:nth-child(2)")
+ntime <- html_nodes(dvs_cal, ".s-lc-ea-ttim td:nth-child(2)")
+nlocation <- html_nodes(dvs_cal, ".s-lc-ea-tloc td:nth-child(2)")
+#  The description nodes vary a great deal (everyone describes their
+#  workshop in different ways).  The code here is likely only going
+#  to pull the first paragraph.  Also, note that it has trouble 
+#  with people who put in heavily styled code chunks in their 
+#  descriptions
+ndescription <- html_nodes(dvs_cal, "p:nth-child(1)")
+nregistration <- html_nodes(dvs_cal, ".s-lc-ea-treg a")
+```
+
+Using rvest functions parse the HTML into vectors
+
+```{r}
+title <- html_text(ntitle)
+date <- html_text(ndate)
+presenter <- html_text(npresenter)
+time <- html_text(ntime)
+location <- html_text(nlocation)
+description <- html_text(ndescription)
+registration <- html_attr(nregistration, "href")
+```
+
+
+Clean the description field which gets funky if someone uses too much formatting in the SpringShare::LibCal web-app.  (I'm looking at you, John L.)
+
+```{r}
+description <- tibble(description) %>% 
+    filter(str_detect(description, "install.packages", negate = TRUE))  %>% 
+    filter(str_detect(description, "Introductory familiarity with R \\(consider attending one of our", 
+                      negate = TRUE))  %>% 
+    filter(description != "A GitHub account") %>%
+    pull(description)
+# description
+```
+
+Make a summary tibble out of the data
+
+```{r}
+results_df <- tibble(date, presenter, registration, time, title, description)
+results_df
+```
+
+Wrangle the data and data types so that the dates are actionable.  Use lubridate to handle the date/time issues.  
+
+```{r}
+dvs_cal_tbl <- results_df %>%
+  separate(time, c("start_time", "end_time"), sep = "-") %>%
+  mutate(date_time_start = force_tz(parse_date_time(str_c(date, start_time, sep = ","), "OmdYIMp"), "America/New_York")) %>%
+  mutate(date_time_end  = force_tz(parse_date_time(str_c(date, end_time,   sep = ","), "OmdYIMp"), "America/New_York")) %>%
+  get_workshop_id  %>%
+  mutate(duration = date_time_end - date_time_start) %>%
+  mutate(workshop_duration_minutes = as.numeric(duration) * 60) %>% 
+  mutate(date = as_date(date_time_start)) %>% 
+  select(
+    workshop_id,
+    date,
+    title,
+    presenter,
+    workshop_duration_minutes,
+    date_time_start,
+    date_time_end,
+    description,
+    registration,
+    location
+  ) %>%
+  mutate(location = NA) %>% 
+  mutate(theme = NA) %>%
+  mutate(theme2 = NA) %>%
+  mutate(cname = NA) %>%
+  mutate(status = NA) 
+
+dvs_cal_tbl
+```    
+  
+## Make an example attendance sheet
+
+```{r}
+attendance_template_tbl <- dvs_cal_tbl %>% 
+  bind_cols(blank_df) %>% 
+  rename(`Workshop Date` = date) %>%
+  select(15:16, `Workshop Date`,
+         `Workshop Name` = title,
+         `WorkshopID` = workshop_id,
+         17:30
+         )
+attendance_template_tbl 
+```
+
+## Write google sheets
+
+### Master Workshop List
+
+**First**, write the _Master Workshop List_ to google drive.
+
+This automates the list of workshops identified at the beginning of a semester.  It is derived from a webscrape of springshare::libcal at the beginning of the semester.  If this is run later in the semester, it only include the workshops from the date of the web-scrape and moving forward.  i.e. It will not include January and February workshops if run in March.
+
+```{r}
+workshop_summary_list <- dvs_cal_tbl %>% 
+  # get_workshop_id() %>% 
+  # relocate(workshop_id) %>% # move `workshop_id` to first column position
+  # relocate(title, .after = date)
+  rename(worshop_begins = date_time_start) %>% 
+  rename(workshop_ends = date_time_end) 
+```
+
+
+The following code chunks are manually disabled because they write files to google drive.  This is "belt and suspenders" caution.  To enable the code-blocks, remove the carriage-return at the end of the third backtick and before the first open curly brace.
+
+```
+{r}
+current_date <- Sys.Date()
+pid <- Sys.getpid()
+gs_title <- str_c(current_date,pid, "Master Workshop List", sep = "-")
+
+gs4_create(gs_title, sheets = list(semester_workshops = workshop_summary_list))
+```
+
+### iterate over all the workshops and write to Google Drive
+
+**Second**, make one blank attendance template for each workshop. Write each blank template to Google Drive.
+
+```
+{r}
+workshop_list <- attendance_template_tbl %>% 
+   #   slice(n = 23:27) %>% 
+   rowwise() %>%
+   group_map(tibble)
+
+walk(
+  workshop_list,
+  ~ gs4_create(.$`Workshop Name`, sheets = list(attendance = .))
+)
+```
+
+### Sleep / Pause
+
+use `Sys.sleep()` or 
+```
+{r}
+walk(
+  seq_len(nrow(band_members)),
+  ~ {
+    f <- slice(band_members, .)
+    gs4_create(f$name,
+      sheets = list(sname = f))
+    Sys.sleep(5)  # pause for 5 seconds between "write"
+  }
+)
+```
+
+
+
